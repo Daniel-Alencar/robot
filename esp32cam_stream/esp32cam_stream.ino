@@ -11,7 +11,9 @@
  */
 
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include "esp_camera.h"
+#include "motors.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
 
@@ -245,6 +247,57 @@ static void startServer() {
   }
 }
 
+// ----------------------------------------------------------------- controle UDP
+// Protocolo de texto, uma mensagem por datagrama:
+//   "V <esq> <dir>"  velocidades em [-1,1]        -> responde "OK <esq> <dir> <rssi>"
+//   "S"              parada imediata              -> responde "OK 0 0 <rssi>"
+//   "P"              ping/keepalive               -> responde "PONG <uptime_ms> <rssi>"
+// UDP e sem conexao: nao compete com o stream HTTP e nao acumula fila quando a
+// rede engasga -- comando atrasado e comando descartado, que e o que queremos
+// num laco de velocidade.
+#define CONTROL_PORT 3333
+
+static WiFiUDP udp;
+static char    udpBuf[64];
+
+static void handleControlPackets() {
+  int size = udp.parsePacket();
+  while (size > 0) {
+    int n = udp.read(udpBuf, sizeof(udpBuf) - 1);
+    if (n < 0) n = 0;
+    udpBuf[n] = '\0';
+
+    char reply[64];
+    reply[0] = '\0';
+
+    if (udpBuf[0] == 'V') {
+      float l = 0, r = 0;
+      if (sscanf(udpBuf + 1, "%f %f", &l, &r) == 2) {
+        motorsSetSpeeds(l, r);
+        snprintf(reply, sizeof(reply), "OK %.2f %.2f %d",
+                 motorsLastLeft(), motorsLastRight(), WiFi.RSSI());
+      } else {
+        snprintf(reply, sizeof(reply), "ERR formato");
+      }
+    } else if (udpBuf[0] == 'S') {
+      motorsStop();
+      snprintf(reply, sizeof(reply), "OK 0.00 0.00 %d", WiFi.RSSI());
+    } else if (udpBuf[0] == 'P') {
+      snprintf(reply, sizeof(reply), "PONG %lu %d", (unsigned long)millis(), WiFi.RSSI());
+    } else {
+      snprintf(reply, sizeof(reply), "ERR comando");
+    }
+
+    if (reply[0]) {
+      udp.beginPacket(udp.remoteIP(), udp.remotePort());
+      udp.write((const uint8_t *)reply, strlen(reply));
+      udp.endPacket();
+    }
+
+    size = udp.parsePacket();   // esvazia a fila: só o último comando importa
+  }
+}
+
 // ----------------------------------------------------------------- setup/loop
 void setup() {
   Serial.begin(115200);
@@ -253,6 +306,10 @@ void setup() {
 
   pinMode(LED_FLASH_GPIO, OUTPUT);
   digitalWrite(LED_FLASH_GPIO, LOW);   // flash desligado
+
+  // Motores primeiro: garante PWM em zero antes de qualquer outra coisa, para
+  // o robo nao arrancar durante a inicializacao da camera/WiFi.
+  motorsBegin();
 
   if (!initCamera()) {
     Serial.println("Reiniciando em 5s...");
@@ -274,14 +331,28 @@ void setup() {
   Serial.printf("Stream: http://%s/stream\n", WiFi.localIP().toString().c_str());
 
   startServer();
+
+  udp.begin(CONTROL_PORT);
+  Serial.printf("Controle UDP escutando na porta %d\n", CONTROL_PORT);
 }
 
 void loop() {
-  // Reconecta se o WiFi cair; o servidor roda em tarefas proprias.
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi caiu, reconectando...");
-    WiFi.reconnect();
-    delay(2000);
+  handleControlPackets();
+
+  if (motorsWatchdogTick()) {
+    Serial.println("Watchdog: sem comando, motores parados.");
   }
-  delay(500);
+
+  // Reconecta se o WiFi cair; o servidor HTTP roda em tarefas proprias.
+  static uint32_t lastWifiCheck = 0;
+  if (millis() - lastWifiCheck > 2000) {
+    lastWifiCheck = millis();
+    if (WiFi.status() != WL_CONNECTED) {
+      motorsStop();              // nunca siga em movimento sem link
+      Serial.println("WiFi caiu, reconectando...");
+      WiFi.reconnect();
+    }
+  }
+
+  delay(2);   // laco em ~500 Hz: latencia baixa para os comandos
 }
